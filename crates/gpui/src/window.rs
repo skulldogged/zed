@@ -3339,7 +3339,7 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
     pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
-        use crate::PaintSurface;
+        use crate::{PaintSurface, PaintSurfaceData};
 
         self.invalidator.debug_assert_paint();
 
@@ -3350,8 +3350,67 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            image_buffer,
+            frame_data: PaintSurfaceData::CoreVideo(image_buffer),
         });
+    }
+
+    /// Paint a video frame into the scene for the next frame at the current z-index.
+    ///
+    /// This is the cross-platform entry point for video rendering. Use this method
+    /// when you have a `VideoFrame` from a video decoder or player.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_video_surface(&mut self, bounds: Bounds<Pixels>, frame: crate::VideoFrame) {
+        use crate::{PaintSurface, PaintSurfaceData, video::VideoFrameData};
+
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+
+        let frame_data = match frame.data {
+            VideoFrameData::Bgra(buffer) => PaintSurfaceData::Bgra {
+                buffer,
+                width: frame.width,
+                height: frame.height,
+            },
+            #[cfg(target_os = "macos")]
+            VideoFrameData::CoreVideo(cv_buffer) => PaintSurfaceData::CoreVideo(cv_buffer),
+            #[cfg(target_os = "windows")]
+            VideoFrameData::D3D11 {
+                texture,
+                subresource_index,
+            } => PaintSurfaceData::D3D11 {
+                texture,
+                subresource_index,
+            },
+        };
+
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            frame_data,
+        });
+    }
+
+    /// Get the D3D11 device for sharing with external video players (Windows only).
+    ///
+    /// This enables zero-copy texture sharing between video decoders (like Media Foundation)
+    /// and GPUI's renderer by using the same D3D11 device for both.
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_device(&self) -> Option<windows::Win32::Graphics::Direct3D11::ID3D11Device> {
+        self.platform_window.d3d11_device()
+    }
+
+    /// Get the Metal device for sharing with external video players (macOS only).
+    ///
+    /// This enables zero-copy texture sharing between video decoders (like AVFoundation)
+    /// and GPUI's renderer by using the same Metal device for both.
+    #[cfg(target_os = "macos")]
+    pub fn metal_device(&self) -> Option<::metal::Device> {
+        self.platform_window.metal_device()
     }
 
     /// Removes an image from the sprite atlas.

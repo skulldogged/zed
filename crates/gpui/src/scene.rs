@@ -653,13 +653,43 @@ impl From<PolychromeSprite> for Primitive {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    /// The video frame data to render.
+    pub frame_data: PaintSurfaceData,
+}
+
+/// The data for a paint surface, containing video frame pixels.
+#[derive(Clone)]
+pub(crate) enum PaintSurfaceData {
+    /// BGRA pixel buffer (CPU-based, works on all platforms)
+    Bgra {
+        buffer: std::sync::Arc<Vec<u8>>,
+        width: u32,
+        height: u32,
+    },
+    /// macOS CoreVideo pixel buffer (zero-copy)
     #[cfg(target_os = "macos")]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    CoreVideo(core_video::pixel_buffer::CVPixelBuffer),
+    /// Windows D3D11 texture (zero-copy)
+    #[cfg(target_os = "windows")]
+    D3D11 {
+        texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        subresource_index: u32,
+    },
+}
+
+impl std::fmt::Debug for PaintSurface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaintSurface")
+            .field("order", &self.order)
+            .field("bounds", &self.bounds)
+            .field("content_mask", &self.content_mask)
+            .finish()
+    }
 }
 
 impl From<PaintSurface> for Primitive {

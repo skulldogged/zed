@@ -54,6 +54,17 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+
+    /// Cached video texture for surface rendering (avoids per-frame allocation)
+    video_texture_cache: Option<VideoTextureCache>,
+}
+
+/// Cached video texture to avoid per-frame allocation
+struct VideoTextureCache {
+    texture: ID3D11Texture2D,
+    srv: ID3D11ShaderResourceView,
+    width: u32,
+    height: u32,
 }
 
 /// Direct3D objects
@@ -174,11 +185,18 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            video_texture_cache: None,
         })
     }
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.atlas.clone()
+    }
+
+    /// Get the D3D11 device for sharing with external video players.
+    /// This enables zero-copy texture sharing with Media Foundation.
+    pub fn get_device(&self) -> Option<ID3D11Device> {
+        self.devices.as_ref().map(|d| d.device.clone())
     }
 
     fn pre_draw(&self) -> Result<()> {
@@ -625,6 +643,208 @@ impl DirectXRenderer {
         if surfaces.is_empty() {
             return Ok(());
         }
+
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+
+        // Process each surface (usually just one for video)
+        for surface in surfaces {
+            // Extract frame data
+            let (srv, width, height) = match &surface.frame_data {
+                crate::PaintSurfaceData::Bgra {
+                    buffer,
+                    width,
+                    height,
+                } => {
+                    let width = *width;
+                    let height = *height;
+
+                    if width == 0 || height == 0 || buffer.is_empty() {
+                        continue;
+                    }
+
+                    // Check if we need to recreate the texture (size changed or doesn't exist)
+                    let needs_new_texture = match &self.video_texture_cache {
+                        Some(cache) => cache.width != width || cache.height != height,
+                        None => true,
+                    };
+
+                    if needs_new_texture {
+                        // Create a DYNAMIC texture for faster CPU→GPU updates
+                        let texture_desc = D3D11_TEXTURE2D_DESC {
+                            Width: width,
+                            Height: height,
+                            MipLevels: 1,
+                            ArraySize: 1,
+                            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Usage: D3D11_USAGE_DYNAMIC,
+                            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                            MiscFlags: 0,
+                        };
+
+                        let texture: ID3D11Texture2D = unsafe {
+                            let mut tex = None;
+                            devices
+                                .device
+                                .CreateTexture2D(&texture_desc, None, Some(&mut tex))?;
+                            tex.context("Failed to create video texture")?
+                        };
+
+                        // Create shader resource view for the texture
+                        let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
+                            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2D: D3D11_TEX2D_SRV {
+                                    MostDetailedMip: 0,
+                                    MipLevels: 1,
+                                },
+                            },
+                        };
+
+                        let srv: ID3D11ShaderResourceView = unsafe {
+                            let mut view = None;
+                            devices.device.CreateShaderResourceView(
+                                &texture,
+                                Some(&srv_desc),
+                                Some(&mut view),
+                            )?;
+                            view.context("Failed to create shader resource view")?
+                        };
+
+                        self.video_texture_cache = Some(VideoTextureCache {
+                            texture,
+                            srv,
+                            width,
+                            height,
+                        });
+                    }
+
+                    // Update the cached texture with new pixel data using Map/Unmap
+                    let cache = self.video_texture_cache.as_ref().unwrap();
+                    unsafe {
+                        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                        devices.device_context.Map(
+                            &cache.texture,
+                            0,
+                            D3D11_MAP_WRITE_DISCARD,
+                            0,
+                            Some(&mut mapped),
+                        )?;
+
+                        // Copy pixel data row by row (in case pitch differs)
+                        let src_pitch = width as usize * 4;
+                        let dst_pitch = mapped.RowPitch as usize;
+                        let src = buffer.as_ptr();
+                        let dst = mapped.pData as *mut u8;
+
+                        if src_pitch == dst_pitch {
+                            // Fast path: same pitch, copy all at once
+                            std::ptr::copy_nonoverlapping(src, dst, buffer.len());
+                        } else {
+                            // Row by row copy
+                            for row in 0..height as usize {
+                                std::ptr::copy_nonoverlapping(
+                                    src.add(row * src_pitch),
+                                    dst.add(row * dst_pitch),
+                                    src_pitch,
+                                );
+                            }
+                        }
+
+                        devices.device_context.Unmap(&cache.texture, 0);
+                    }
+
+                    (cache.srv.clone(), width, height)
+                }
+                crate::PaintSurfaceData::D3D11 {
+                    texture,
+                    subresource_index,
+                } => {
+                    // Zero-copy path: create SRV directly from provided texture
+                    let desc = unsafe {
+                        let mut desc = D3D11_TEXTURE2D_DESC::default();
+                        texture.GetDesc(&mut desc);
+                        desc
+                    };
+
+                    let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+                        Format: desc.Format,
+                        ViewDimension: if desc.ArraySize > 1 {
+                            D3D_SRV_DIMENSION_TEXTURE2DARRAY
+                        } else {
+                            D3D_SRV_DIMENSION_TEXTURE2D
+                        },
+                        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
+                                MostDetailedMip: 0,
+                                MipLevels: 1,
+                                FirstArraySlice: *subresource_index,
+                                ArraySize: 1,
+                            },
+                        },
+                    };
+
+                    let srv: ID3D11ShaderResourceView = unsafe {
+                        let mut view = None;
+                        devices.device.CreateShaderResourceView(
+                            texture,
+                            Some(&srv_desc),
+                            Some(&mut view),
+                        )?;
+                        view.context("Failed to create SRV from D3D11 texture")?
+                    };
+
+                    (srv, desc.Width, desc.Height)
+                }
+            };
+
+            // Update the surface buffer and draw using polychrome sprite pipeline
+            // (reusing existing pipeline that can render textured quads)
+            self.pipelines.poly_sprites.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                slice::from_ref(&PolychromeSprite {
+                    order: surface.order,
+                    pad: 0,
+                    grayscale: false,
+                    opacity: 1.0,
+                    bounds: surface.bounds,
+                    content_mask: surface.content_mask.clone(),
+                    corner_radii: Default::default(),
+                    tile: crate::AtlasTile {
+                        texture_id: crate::AtlasTextureId {
+                            index: 0,
+                            kind: crate::AtlasTextureKind::Polychrome,
+                        },
+                        tile_id: crate::TileId(0),
+                        padding: 0,
+                        bounds: crate::Bounds {
+                            origin: crate::point(crate::DevicePixels(0), crate::DevicePixels(0)),
+                            size: crate::size(
+                                crate::DevicePixels(width as i32),
+                                crate::DevicePixels(height as i32),
+                            ),
+                        },
+                    },
+                }),
+            )?;
+
+            self.pipelines.poly_sprites.draw_with_texture(
+                &devices.device_context,
+                slice::from_ref(&Some(srv)),
+                slice::from_ref(&resources.viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.sampler),
+                1,
+            )?;
+        }
+
         Ok(())
     }
 

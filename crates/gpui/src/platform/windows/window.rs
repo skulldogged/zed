@@ -213,6 +213,11 @@ impl WindowsWindowState {
     fn content_size(&self) -> Size<Pixels> {
         self.logical_size.get()
     }
+
+    /// Get the D3D11 device for sharing with external video players.
+    pub fn get_d3d11_device(&self) -> Option<windows::Win32::Graphics::Direct3D11::ID3D11Device> {
+        self.renderer.borrow().get_device()
+    }
 }
 
 impl WindowsWindowInner {
@@ -918,6 +923,10 @@ impl PlatformWindow for WindowsWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.state.renderer.borrow().gpu_specs().log_err()
+    }
+
+    fn d3d11_device(&self) -> Option<windows::Win32::Graphics::Direct3D11::ID3D11Device> {
+        self.state.get_d3d11_device()
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {

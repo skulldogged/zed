@@ -1,8 +1,8 @@
 use super::metal_atlas::MetalAtlas;
 use crate::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    PaintSurfaceData, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
+    Shadow, Size, Surface, Underline, point, size,
 };
 use anyhow::Result;
 use block::ConcreteBlock;
@@ -1089,35 +1089,47 @@ impl MetalRenderer {
         );
 
         for surface in surfaces {
+            // Handle different surface data types
+            let image_buffer = match &surface.frame_data {
+                PaintSurfaceData::CoreVideo(cv_buffer) => cv_buffer,
+                PaintSurfaceData::Bgra { .. } => {
+                    // TODO: Implement BGRA texture upload path for CPU-based frames
+                    // For now, skip BGRA surfaces on the Metal renderer
+                    // This would require creating a Metal texture and uploading the BGRA data
+                    log::warn!("BGRA surface rendering not yet implemented in Metal renderer");
+                    continue;
+                }
+            };
+
             let texture_size = size(
-                DevicePixels::from(surface.image_buffer.get_width() as i32),
-                DevicePixels::from(surface.image_buffer.get_height() as i32),
+                DevicePixels::from(image_buffer.get_width() as i32),
+                DevicePixels::from(image_buffer.get_height() as i32),
             );
 
             assert_eq!(
-                surface.image_buffer.get_pixel_format(),
+                image_buffer.get_pixel_format(),
                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
             );
 
             let y_texture = self
                 .core_video_texture_cache
                 .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
+                    image_buffer.as_concrete_TypeRef(),
                     None,
                     MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
+                    image_buffer.get_width_of_plane(0),
+                    image_buffer.get_height_of_plane(0),
                     0,
                 )
                 .unwrap();
             let cb_cr_texture = self
                 .core_video_texture_cache
                 .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
+                    image_buffer.as_concrete_TypeRef(),
                     None,
                     MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
+                    image_buffer.get_width_of_plane(1),
+                    image_buffer.get_height_of_plane(1),
                     1,
                 )
                 .unwrap();
@@ -1138,7 +1150,6 @@ impl MetalRenderer {
                 mem::size_of_val(&texture_size) as u64,
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
-            // let y_texture = y_texture.get_texture().unwrap().
             command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
                 let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
                 Some(metal::TextureRef::from_ptr(texture as *mut _))
@@ -1165,6 +1176,11 @@ impl MetalRenderer {
             *instance_offset = next_offset;
         }
         true
+    }
+
+    /// Get a reference to the Metal device.
+    pub fn device(&self) -> &metal::Device {
+        &self.device
     }
 }
 

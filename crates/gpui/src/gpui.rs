@@ -46,6 +46,7 @@ mod taffy;
 pub mod test;
 mod text_system;
 mod util;
+mod video;
 mod view;
 mod window;
 
@@ -112,6 +113,7 @@ pub use text_system::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use util::smol_timeout;
 pub use util::{FutureExt, Timeout, arc_cow::ArcCow};
+pub use video::VideoFrame;
 pub use view::*;
 pub use window::*;
 

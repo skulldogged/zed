@@ -564,6 +564,20 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
 
+    /// Get the D3D11 device for external video players (Windows only).
+    /// Returns None by default, overridden on Windows.
+    #[cfg(target_os = "windows")]
+    fn d3d11_device(&self) -> Option<::windows::Win32::Graphics::Direct3D11::ID3D11Device> {
+        None
+    }
+
+    /// Get the Metal device for external video players (macOS only).
+    /// Returns None by default, overridden on macOS.
+    #[cfg(target_os = "macos")]
+    fn metal_device(&self) -> Option<::metal::Device> {
+        None
+    }
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
     #[cfg(any(test, feature = "test-support"))]

@@ -1526,6 +1526,10 @@ impl PlatformWindow for MacWindow {
         None
     }
 
+    fn metal_device(&self) -> Option<::metal::Device> {
+        Some(self.0.lock().renderer.device().clone())
+    }
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
         let executor = self.0.lock().executor.clone();
         executor
