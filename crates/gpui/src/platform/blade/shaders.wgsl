@@ -1322,8 +1322,8 @@ fn fs_surface_bgra(input: SurfaceVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    // Sample BGRA texture and swizzle to RGBA
-    // Using Bgra8Unorm (not Srgb) so we need manual swizzle
+    // Sample BGRA texture - Bgra8Unorm format automatically maps
+    // memory bytes (B,G,R,A) to shader channels (.r,.g,.b,.a) correctly
     let sample = textureSampleLevel(t_bgra, s_bgra, input.texture_position, 0.0);
-    return vec4<f32>(sample.b, sample.g, sample.r, sample.a);
+    return sample;
 }
