@@ -108,6 +108,14 @@ struct ShaderSurfacesData {
     s_surface: gpu::Sampler,
 }
 
+#[derive(blade_macros::ShaderData)]
+struct ShaderSurfacesBgraData {
+    globals: GlobalParams,
+    surface_bgra_locals: SurfaceParams,
+    t_bgra: gpu::TextureView,
+    s_bgra: gpu::Sampler,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 struct PathSprite {
@@ -132,6 +140,7 @@ struct BladePipelines {
     mono_sprites: gpu::RenderPipeline,
     poly_sprites: gpu::RenderPipeline,
     surfaces: gpu::RenderPipeline,
+    surfaces_bgra: gpu::RenderPipeline,
 }
 
 impl BladePipelines {
@@ -301,6 +310,20 @@ impl BladePipelines {
                 color_targets,
                 multisample_state: gpu::MultisampleState::default(),
             }),
+            surfaces_bgra: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                name: "surfaces-bgra",
+                data_layouts: &[&ShaderSurfacesBgraData::layout()],
+                vertex: shader.at("vs_surface_bgra"),
+                vertex_fetches: &[],
+                primitive: gpu::PrimitiveState {
+                    topology: gpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                fragment: Some(shader.at("fs_surface_bgra")),
+                color_targets,
+                multisample_state: gpu::MultisampleState::default(),
+            }),
         }
     }
 
@@ -313,12 +336,21 @@ impl BladePipelines {
         gpu.destroy_render_pipeline(&mut self.mono_sprites);
         gpu.destroy_render_pipeline(&mut self.poly_sprites);
         gpu.destroy_render_pipeline(&mut self.surfaces);
+        gpu.destroy_render_pipeline(&mut self.surfaces_bgra);
     }
 }
 
 pub struct BladeSurfaceConfig {
     pub size: gpu::Extent,
     pub transparent: bool,
+}
+
+/// Cache for video surface textures to avoid recreation on every frame.
+struct VideoTextureCache {
+    texture: gpu::Texture,
+    texture_view: gpu::TextureView,
+    width: u32,
+    height: u32,
 }
 
 //Note: we could see some of these fields moved into `BladeContext`
@@ -342,6 +374,8 @@ pub struct BladeRenderer {
     path_intermediate_msaa_texture: Option<gpu::Texture>,
     path_intermediate_msaa_texture_view: Option<gpu::TextureView>,
     rendering_parameters: RenderingParameters,
+    /// Cache for video surface textures (BGRA path)
+    video_texture_cache: Option<VideoTextureCache>,
 }
 
 impl BladeRenderer {
@@ -428,6 +462,7 @@ impl BladeRenderer {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_texture_view,
             rendering_parameters,
+            video_texture_cache: None,
         })
     }
 
@@ -815,91 +850,208 @@ impl BladeRenderer {
                     encoder.draw(0, 4, 0, sprites.len() as u32);
                 }
                 PrimitiveBatch::Surfaces(surfaces) => {
-                    let mut _encoder = pass.with(&self.pipelines.surfaces);
-
                     for surface in surfaces {
-                        #[cfg(not(target_os = "macos"))]
-                        {
-                            let _ = surface;
-                            continue;
-                        };
+                        match &surface.frame_data {
+                            #[cfg(target_os = "macos")]
+                            crate::PaintSurfaceData::CoreVideo(image_buffer) => {
+                                let mut encoder = pass.with(&self.pipelines.surfaces);
+                                let (t_y, t_cb_cr) = unsafe {
+                                    use core_foundation::base::TCFType as _;
+                                    use std::ptr;
 
-                        #[cfg(target_os = "macos")]
-                        {
-                            let (t_y, t_cb_cr) = unsafe {
-                                use core_foundation::base::TCFType as _;
-                                use std::ptr;
-
-                                assert_eq!(
-                                        surface.image_buffer.get_pixel_format(),
+                                    assert_eq!(
+                                        image_buffer.get_pixel_format(),
                                         core_video::pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
                                     );
 
-                                let y_texture = self
-                                    .core_video_texture_cache
-                                    .create_texture_from_image(
-                                        surface.image_buffer.as_concrete_TypeRef(),
-                                        ptr::null(),
-                                        metal::MTLPixelFormat::R8Unorm,
-                                        surface.image_buffer.get_width_of_plane(0),
-                                        surface.image_buffer.get_height_of_plane(0),
-                                        0,
-                                    )
-                                    .unwrap();
-                                let cb_cr_texture = self
-                                    .core_video_texture_cache
-                                    .create_texture_from_image(
-                                        surface.image_buffer.as_concrete_TypeRef(),
-                                        ptr::null(),
-                                        metal::MTLPixelFormat::RG8Unorm,
-                                        surface.image_buffer.get_width_of_plane(1),
-                                        surface.image_buffer.get_height_of_plane(1),
-                                        1,
-                                    )
-                                    .unwrap();
-                                (
-                                    gpu::TextureView::from_metal_texture(
-                                        &objc2::rc::Retained::retain(
-                                            foreign_types::ForeignTypeRef::as_ptr(
-                                                y_texture.as_texture_ref(),
-                                            )
-                                                as *mut objc2::runtime::ProtocolObject<
-                                                    dyn objc2_metal::MTLTexture,
-                                                >,
+                                    let y_texture = self
+                                        .core_video_texture_cache
+                                        .create_texture_from_image(
+                                            image_buffer.as_concrete_TypeRef(),
+                                            ptr::null(),
+                                            metal::MTLPixelFormat::R8Unorm,
+                                            image_buffer.get_width_of_plane(0),
+                                            image_buffer.get_height_of_plane(0),
+                                            0,
                                         )
-                                        .unwrap(),
-                                        gpu::TexelAspects::COLOR,
-                                    ),
-                                    gpu::TextureView::from_metal_texture(
-                                        &objc2::rc::Retained::retain(
-                                            foreign_types::ForeignTypeRef::as_ptr(
-                                                cb_cr_texture.as_texture_ref(),
-                                            )
-                                                as *mut objc2::runtime::ProtocolObject<
-                                                    dyn objc2_metal::MTLTexture,
-                                                >,
+                                        .unwrap();
+                                    let cb_cr_texture = self
+                                        .core_video_texture_cache
+                                        .create_texture_from_image(
+                                            image_buffer.as_concrete_TypeRef(),
+                                            ptr::null(),
+                                            metal::MTLPixelFormat::RG8Unorm,
+                                            image_buffer.get_width_of_plane(1),
+                                            image_buffer.get_height_of_plane(1),
+                                            1,
                                         )
-                                        .unwrap(),
-                                        gpu::TexelAspects::COLOR,
-                                    ),
-                                )
-                            };
+                                        .unwrap();
+                                    (
+                                        gpu::TextureView::from_metal_texture(
+                                            &objc2::rc::Retained::retain(
+                                                foreign_types::ForeignTypeRef::as_ptr(
+                                                    y_texture.as_texture_ref(),
+                                                )
+                                                    as *mut objc2::runtime::ProtocolObject<
+                                                        dyn objc2_metal::MTLTexture,
+                                                    >,
+                                            )
+                                            .unwrap(),
+                                            gpu::TexelAspects::COLOR,
+                                        ),
+                                        gpu::TextureView::from_metal_texture(
+                                            &objc2::rc::Retained::retain(
+                                                foreign_types::ForeignTypeRef::as_ptr(
+                                                    cb_cr_texture.as_texture_ref(),
+                                                )
+                                                    as *mut objc2::runtime::ProtocolObject<
+                                                        dyn objc2_metal::MTLTexture,
+                                                    >,
+                                            )
+                                            .unwrap(),
+                                            gpu::TexelAspects::COLOR,
+                                        ),
+                                    )
+                                };
 
-                            _encoder.bind(
-                                0,
-                                &ShaderSurfacesData {
-                                    globals,
-                                    surface_locals: SurfaceParams {
-                                        bounds: surface.bounds.into(),
-                                        content_mask: surface.content_mask.bounds.into(),
+                                encoder.bind(
+                                    0,
+                                    &ShaderSurfacesData {
+                                        globals,
+                                        surface_locals: SurfaceParams {
+                                            bounds: surface.bounds.into(),
+                                            content_mask: surface.content_mask.bounds.into(),
+                                        },
+                                        t_y,
+                                        t_cb_cr,
+                                        s_surface: self.atlas_sampler,
                                     },
-                                    t_y,
-                                    t_cb_cr,
-                                    s_surface: self.atlas_sampler,
-                                },
-                            );
+                                );
 
-                            _encoder.draw(0, 4, 0, 1);
+                                encoder.draw(0, 4, 0, 1);
+                            }
+                            crate::PaintSurfaceData::Bgra { buffer, width, height } => {
+                                let width = *width;
+                                let height = *height;
+
+                                if width == 0 || height == 0 || buffer.is_empty() {
+                                    continue;
+                                }
+
+                                // Check if we need to recreate the texture (size changed or doesn't exist)
+                                let needs_new_texture = match &self.video_texture_cache {
+                                    Some(cache) => cache.width != width || cache.height != height,
+                                    None => true,
+                                };
+
+                                if needs_new_texture {
+                                    // Destroy old texture if it exists
+                                    if let Some(old_cache) = self.video_texture_cache.take() {
+                                        self.gpu.destroy_texture_view(old_cache.texture_view);
+                                        self.gpu.destroy_texture(old_cache.texture);
+                                    }
+
+                                    // Create new texture for BGRA data
+                                    // Use Bgra8Unorm (not Srgb) - video frames are already in correct color space
+                                    // and don't need sRGB gamma decoding (which would make them too dark)
+                                    let texture = self.gpu.create_texture(gpu::TextureDesc {
+                                        name: "video surface bgra",
+                                        format: gpu::TextureFormat::Bgra8Unorm,
+                                        size: gpu::Extent {
+                                            width,
+                                            height,
+                                            depth: 1,
+                                        },
+                                        array_layer_count: 1,
+                                        mip_level_count: 1,
+                                        sample_count: 1,
+                                        dimension: gpu::TextureDimension::D2,
+                                        usage: gpu::TextureUsage::COPY | gpu::TextureUsage::RESOURCE,
+                                        external: None,
+                                    });
+                                    let texture_view = self.gpu.create_texture_view(
+                                        texture,
+                                        gpu::TextureViewDesc {
+                                            name: "video surface bgra view",
+                                            format: gpu::TextureFormat::Bgra8Unorm,
+                                            dimension: gpu::ViewDimension::D2,
+                                            subresources: &Default::default(),
+                                        },
+                                    );
+
+                                    self.video_texture_cache = Some(VideoTextureCache {
+                                        texture,
+                                        texture_view,
+                                        width,
+                                        height,
+                                    });
+                                }
+
+                                // Get texture info for rendering
+                                let (texture, texture_view) = match &self.video_texture_cache {
+                                    Some(cache) => (cache.texture, cache.texture_view),
+                                    None => continue,
+                                };
+
+                                // Drop the render pass to do texture upload
+                                drop(pass);
+
+                                // Upload pixel data to the texture via transfer pass
+                                {
+                                    self.command_encoder.init_texture(texture);
+                                    let mut transfer = self.command_encoder.transfer("video upload");
+                                    let staging_buffer = self.instance_belt.alloc_bytes(buffer.as_slice(), &self.gpu);
+                                    transfer.copy_buffer_to_texture(
+                                        staging_buffer,
+                                        width * 4, // bytes per row
+                                        gpu::TexturePiece {
+                                            texture,
+                                            mip_level: 0,
+                                            array_layer: 0,
+                                            origin: [0, 0, 0],
+                                        },
+                                        gpu::Extent {
+                                            width,
+                                            height,
+                                            depth: 1,
+                                        },
+                                    );
+                                }
+
+                                // Recreate render pass and draw
+                                pass = self.command_encoder.render(
+                                    "main",
+                                    gpu::RenderTargetSet {
+                                        colors: &[gpu::RenderTarget {
+                                            view: frame.texture_view(),
+                                            init_op: gpu::InitOp::Load,
+                                            finish_op: gpu::FinishOp::Store,
+                                        }],
+                                        depth_stencil: None,
+                                    },
+                                );
+
+                                let mut encoder = pass.with(&self.pipelines.surfaces_bgra);
+                                encoder.bind(
+                                    0,
+                                    &ShaderSurfacesBgraData {
+                                        globals,
+                                        surface_bgra_locals: SurfaceParams {
+                                            bounds: surface.bounds.into(),
+                                            content_mask: surface.content_mask.bounds.into(),
+                                        },
+                                        t_bgra: texture_view,
+                                        s_bgra: self.atlas_sampler,
+                                    },
+                                );
+
+                                encoder.draw(0, 4, 0, 1);
+                            }
+                            #[cfg(target_os = "windows")]
+                            crate::PaintSurfaceData::D3D11 { .. } => {
+                                // D3D11 textures are handled by the DirectX renderer, not Blade
+                                log::warn!("D3D11 surface passed to Blade renderer - this should not happen");
+                            }
                         }
                     }
                 }

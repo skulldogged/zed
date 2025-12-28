@@ -1247,7 +1247,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     return blend_color(color, sprite.opacity * saturate(0.5 - distance));
 }
 
-// --- surfaces --- //
+// --- surfaces (YCbCr - macOS CoreVideo) --- //
 
 struct SurfaceParams {
     bounds: Bounds,
@@ -1296,4 +1296,34 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         1.0);
 
     return ycbcr_to_RGB * y_cb_cr;
+}
+
+// --- surfaces (BGRA - Linux/cross-platform) --- //
+
+var<uniform> surface_bgra_locals: SurfaceParams;
+var t_bgra: texture_2d<f32>;
+var s_bgra: sampler;
+
+@vertex
+fn vs_surface_bgra(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+
+    var out = SurfaceVarying();
+    out.position = to_device_position(unit_vertex, surface_bgra_locals.bounds);
+    out.texture_position = unit_vertex;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, surface_bgra_locals.bounds, surface_bgra_locals.content_mask);
+    return out;
+}
+
+@fragment
+fn fs_surface_bgra(input: SurfaceVarying) -> @location(0) vec4<f32> {
+    // Alpha clip after using the derivatives.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    // Sample BGRA texture and swizzle to RGBA
+    // Using Bgra8Unorm (not Srgb) so we need manual swizzle
+    let sample = textureSampleLevel(t_bgra, s_bgra, input.texture_position, 0.0);
+    return vec4<f32>(sample.b, sample.g, sample.r, sample.a);
 }
